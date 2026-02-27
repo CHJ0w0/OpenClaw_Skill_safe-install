@@ -1,11 +1,11 @@
 {
   "slug": "skill-safe-install",
   "name": "Skills 安全安装工具",
-  "version": "1.0.0",
-  "description": "自动执行 ClawHub 评分检查 + ThreatBook 沙箱扫描双层验证",
+  "version": "2.0.0",
+  "description": "整合 Vetter 代码审查 + ClawHub 评分 + ThreatBook 沙箱扫描三层验证",
   "author": "OpenClaw Security",
   "license": "MIT",
-  "tags": ["security", "safety", "installer", "threatbook"],
+  "tags": ["security", "safety", "installer", "threatbook", "vetter"],
   "repository": "https://github.com/CHJ0w0/OpenClaw_Skill_safe-install",
   "homepage": "https://github.com/CHJ0w0/OpenClaw_Skill_safe-install#readme",
   "scripts": {
