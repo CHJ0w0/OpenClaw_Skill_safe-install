@@ -4,10 +4,11 @@
  * Skills 安全安装工具
  * 
  * 整合完整安全检查流程：
- * 1. ClawHub 评分检查
- * 2. ThreatBook 沙箱扫描
- * 3. 自动决策或询问任务下达者
- * 4. 执行安装
+ * 1. Skill-Vetter 来源与代码审查
+ * 2. ClawHub 评分检查
+ * 3. ThreatBook 沙箱扫描
+ * 4. 自动决策或询问任务下达者
+ * 5. 执行安装
  * 
  * 退出码:
  *   0 - 安装成功
@@ -16,10 +17,11 @@
  *   3 - API 调用失败
  *   4 - 评分过低，等待确认
  *   5 - 用户取消安装
+ *   6 - Vetter 检查发现红旗
  */
 
 import { execSync } from 'child_process';
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, readdirSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { platform } from 'os';
@@ -68,6 +70,7 @@ function logSection(title) {
 function parseArgs(args) {
   const options = {
     force: args.includes('--force'),
+    noVetter: args.includes('--no-vetter'),
     noScan: args.includes('--no-scan'),
     dryRun: args.includes('--dry-run'),
     timeout: parseInt(args.find(a => a.startsWith('--timeout='))?.split('=')[1] || '120') * 1000,
@@ -89,16 +92,18 @@ function showHelp() {
 
 选项:
   --force         强制安装（跳过可疑警告）
+  --no-vetter     跳过 Vetter 代码审查（不推荐）
   --no-scan       跳过沙箱扫描（不推荐）
   --dry-run       仅检查，不实际安装
   --timeout=<秒>  沙箱扫描超时时间（默认 120 秒）
   --help, -h      显示帮助
 
 安全检查流程:
-  1. ClawHub 评分检查 (≥3.5 分？)
-  2. ThreatBook 沙箱扫描
-  3. 自动决策或询问任务下达者
-  4. 执行安装
+  1. Skill-Vetter 来源与代码审查（检查红旗）
+  2. ClawHub 评分检查 (≥3.5 分？)
+  3. ThreatBook 沙箱扫描
+  4. 自动决策或询问任务下达者
+  5. 执行安装
 
 示例:
   node safe-install.mjs tavily-search
@@ -131,9 +136,222 @@ function execCommand(cmd, options = {}) {
   }
 }
 
-// 第一步：ClawHub 评分检查
+// 红旗检测规则（来自 skill-vetter）
+const RED_FLAGS = [
+  { pattern: /curl\s+.*\|.*bash/i, name: 'Curl pipe to bash', severity: 'extreme' },
+  { pattern: /wget\s+.*\|.*bash/i, name: 'Wget pipe to bash', severity: 'extreme' },
+  { pattern: /curl.*-d.*@.*(?:\/etc\/|\/home\/|\.ssh|\.aws)/i, name: 'Sending sensitive data', severity: 'extreme' },
+  { pattern: /eval\s*\(/i, name: 'Use of eval()', severity: 'high' },
+  { pattern: /exec\s*\(/i, name: 'Use of exec()', severity: 'high' },
+  { pattern: /child_process\.exec/i, name: 'Child process exec', severity: 'high' },
+  { pattern: /spawn\s*\(/i, name: 'Spawn process', severity: 'medium' },
+  { pattern: /\.ssh\//i, name: 'Accessing .ssh directory', severity: 'extreme' },
+  { pattern: /\.aws\//i, name: 'Accessing .aws directory', severity: 'extreme' },
+  { pattern: /MEMORY\.md|USER\.md|SOUL\.md|IDENTITY\.md/i, name: 'Accessing memory files', severity: 'high' },
+  { pattern: /base64\s*decode|atob\s*\(/i, name: 'Base64 decode', severity: 'medium' },
+  { pattern: /fs\.readFile.*(?:\/etc\/passwd|\/etc\/shadow)/i, name: 'Reading system files', severity: 'extreme' },
+  { pattern: /sudo\s+/i, name: 'Sudo command', severity: 'high' },
+  { pattern: /document\.cookie/i, name: 'Accessing cookies', severity: 'high' },
+  { pattern: /localStorage|sessionStorage/i, name: 'Accessing storage', severity: 'medium' },
+  { pattern: /fetch\s*\(['"`]http/i, name: 'HTTP request', severity: 'low' },
+  { pattern: /XMLHttpRequest/i, name: 'XHR request', severity: 'low' },
+  { pattern: /net\.connect|socket\.connect/i, name: 'Network connection', severity: 'medium' },
+  { pattern: /require\s*\(['"`]child_process['"`]\)/i, name: 'Child process module', severity: 'medium' },
+  { pattern: /require\s*\(['"`]fs['"`]\)/i, name: 'File system module', severity: 'low' },
+  { pattern: /require\s*\(['"`]net['"`]\)/i, name: 'Network module', severity: 'medium' },
+  { pattern: /chmod\s+777/i, name: 'Insecure permissions', severity: 'high' },
+  { pattern: /rm\s+-rf\s+\//i, name: 'Dangerous rm command', severity: 'extreme' },
+  { pattern: /mktemp|\/tmp\//i, name: 'Temp file usage', severity: 'low' },
+];
+
+// 第一步：Skill-Vetter 代码审查
+async function vetSkill(skillName, options) {
+  logSection('第一步：Skill-Vetter 代码审查');
+  
+  const result = {
+    passed: true,
+    riskLevel: 'low',
+    redFlags: [],
+    permissions: {
+      files: [],
+      network: [],
+      commands: []
+    },
+    source: 'unknown',
+    author: 'unknown',
+    needsConfirm: false
+  };
+  
+  log(`🔍 获取 Skill 信息...`, 'cyan');
+  
+  // 获取 Skill 元数据
+  const inspectResult = execCommand(`clawhub inspect "${skillName}"`, { silent: true });
+  
+  if (inspectResult.success) {
+    const output = inspectResult.output;
+    
+    // 提取作者信息
+    const authorMatch = output.match(/Owner:\s*(\S+)/i);
+    if (authorMatch) {
+      result.author = authorMatch[1];
+      log(`👤 作者：${result.author}`, 'cyan');
+    }
+    
+    // 提取更新时间
+    const updatedMatch = output.match(/Updated:\s*(\S+)/i);
+    if (updatedMatch) {
+      log(`📅 更新时间：${updatedMatch[1]}`, 'cyan');
+    }
+    
+    // 提取版本
+    const versionMatch = output.match(/Latest:\s*(\S+)/i);
+    if (versionMatch) {
+      log(`📦 版本：${versionMatch[1]}`, 'cyan');
+    }
+  }
+  
+  // 信任层级检查
+  log(`\n📊 信任层级评估...`, 'cyan');
+  
+  if (result.author === 'openclaw' || result.author === 'OpenClaw') {
+    log(`✅ 官方 OpenClaw Skill - 较低审查`, 'green');
+    result.source = 'official';
+    result.riskLevel = 'low';
+  } else if (['spclaudehome', 'CHJ0w0'].includes(result.author)) {
+    log(`✅ 已知作者 - 中等审查`, 'green');
+    result.source = 'known_author';
+    result.riskLevel = 'medium';
+  } else {
+    log(`⚠️ 未知作者 - 最高审查`, 'yellow');
+    result.source = 'unknown';
+    result.riskLevel = 'high';
+    result.needsConfirm = true;
+  }
+  
+  // 临时下载 Skill 进行代码审查
+  log(`\n📥 下载 Skill 进行代码审查...`, 'cyan');
+  const tempDir = `/tmp/vet-skill-${Date.now()}`;
+  mkdirSync(tempDir, { recursive: true });
+  
+  try {
+    const downloadResult = execCommand(`clawhub install "${skillName}" --dir "${tempDir}"`, { silent: true });
+    
+    if (!downloadResult.success) {
+      log(`⚠️ 无法下载 Skill 进行审查`, 'yellow');
+      return result;
+    }
+    
+    const skillPath = path.join(tempDir, skillName);
+    log(`📂 审查目录：${skillPath}`, 'cyan');
+    
+    // 扫描所有 JS/MJS 文件
+    const jsFiles = [];
+    function scanDir(dir) {
+      const files = readdirSync(dir);
+      for (const file of files) {
+        const filePath = path.join(dir, file);
+        const stat = existsSync(filePath) ? require('fs').statSync(filePath) : null;
+        if (stat?.isDirectory() && !file.startsWith('.') && file !== 'node_modules') {
+          scanDir(filePath);
+        } else if (file.endsWith('.js') || file.endsWith('.mjs')) {
+          jsFiles.push(filePath);
+        }
+      }
+    }
+    scanDir(skillPath);
+    
+    log(`📄 发现 ${jsFiles.length} 个脚本文件`, 'cyan');
+    
+    // 检查每个文件的红旗
+    for (const jsFile of jsFiles) {
+      const content = readFileSync(jsFile, 'utf8');
+      const relativePath = path.relative(skillPath, jsFile);
+      
+      for (const flag of RED_FLAGS) {
+        const matches = content.match(flag.pattern);
+        if (matches) {
+          const flagInfo = {
+            file: relativePath,
+            name: flag.name,
+            severity: flag.severity,
+            line: content.substring(0, matches.index).split('\n').length
+          };
+          
+          result.redFlags.push(flagInfo);
+          
+          // 记录权限需求
+          if (flag.name.includes('fs') || flag.name.includes('File')) {
+            result.permissions.files.push(relativePath);
+          }
+          if (flag.name.includes('fetch') || flag.name.includes('HTTP') || flag.name.includes('Network')) {
+            result.permissions.network.push(relativePath);
+          }
+          if (flag.name.includes('exec') || flag.name.includes('spawn') || flag.name.includes('sudo')) {
+            result.permissions.commands.push(relativePath);
+          }
+          
+          // 严重红旗直接标记
+          if (flag.severity === 'extreme') {
+            result.passed = false;
+            result.riskLevel = 'extreme';
+          } else if (flag.severity === 'high' && result.riskLevel !== 'extreme') {
+            result.riskLevel = 'high';
+          }
+        }
+      }
+    }
+    
+    // 输出审查结果
+    log(`\n📊 Vetter 审查结果:`, 'cyan');
+    
+    if (result.redFlags.length === 0) {
+      log(`✅ 未发现红旗`, 'green');
+    } else {
+      log(`⚠️ 发现 ${result.redFlags.length} 个潜在问题:`, 'yellow');
+      for (const flag of result.redFlags.slice(0, 10)) { // 只显示前 10 个
+        const severityIcon = flag.severity === 'extreme' ? '🚨' : 
+                            flag.severity === 'high' ? '🔴' : 
+                            flag.severity === 'medium' ? '🟡' : '🟢';
+        log(`  ${severityIcon} ${flag.name} (${flag.file}:${flag.line})`, 
+            flag.severity === 'extreme' ? 'red' : 
+            flag.severity === 'high' ? 'red' : 
+            flag.severity === 'medium' ? 'yellow' : 'reset');
+      }
+      if (result.redFlags.length > 10) {
+        log(`  ... 还有 ${result.redFlags.length - 10} 个问题`, 'yellow');
+      }
+    }
+    
+    // 风险等级
+    const riskIcon = result.riskLevel === 'extreme' ? '⛔' :
+                    result.riskLevel === 'high' ? '🔴' :
+                    result.riskLevel === 'medium' ? '🟡' : '🟢';
+    log(`\n风险等级：${riskIcon} ${result.riskLevel.toUpperCase()}`, 
+        result.riskLevel === 'extreme' ? 'red' : 
+        result.riskLevel === 'high' ? 'red' : 
+        result.riskLevel === 'medium' ? 'yellow' : 'green', true);
+    
+    // 判定
+    if (result.riskLevel === 'extreme') {
+      result.passed = false;
+      result.needsConfirm = false; // 直接拒绝
+    } else if (result.riskLevel === 'high' || result.redFlags.length > 0) {
+      result.needsConfirm = true;
+    }
+    
+    return result;
+    
+  } finally {
+    // 清理临时目录
+    if (existsSync(tempDir)) {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+}
+
+// 第二步：ClawHub 评分检查
 async function checkRating(skillName) {
-  logSection('第一步：ClawHub 评分检查');
+  logSection('第二步：ClawHub 评分检查');
   
   log(`📋 查询 Skill: ${skillName}...`, 'cyan');
   
@@ -151,7 +369,7 @@ async function checkRating(skillName) {
   
   // 解析评分（从输出中提取）
   const output = result.output;
-  const scoreMatch = output.match(/(?:评分|Rating|Score)[:：]?\s*([\d.]+)/i);
+  const scoreMatch = output.match(/(?:评分 |Rating|Score)[:：]?\s*([\d.]+)/i);
   const score = scoreMatch ? parseFloat(scoreMatch[1]) : null;
   
   if (score === null) {
@@ -317,9 +535,9 @@ function analyzeResult(report) {
   return result;
 }
 
-// 第二步：ThreatBook 沙箱扫描
+// 第三步：ThreatBook 沙箱扫描
 async function scanSkill(skillName, options) {
-  logSection('第二步：ThreatBook 沙箱扫描');
+  logSection('第三步：ThreatBook 沙箱扫描');
   
   const apiKey = getApiKey();
   if (!apiKey) {
@@ -414,6 +632,11 @@ function askForConfirmation(skillName, reason, details = {}) {
   
   if (reason === 'low_rating') {
     message = `⚠️ 此 Skill 评分低于安全阈值 (${details.score}/${SAFE_RATING_THRESHOLD})`;
+  } else if (reason === 'vetter_red_flags') {
+    message = `⚠️ Vetter 发现 ${details.redFlags?.length || 0} 个潜在问题`;
+    if (details.riskLevel) {
+      message += `\n   风险等级：${details.riskLevel.toUpperCase()}`;
+    }
   } else if (reason === 'suspicious') {
     message = `⚠️ 沙箱扫描发现可疑内容`;
     if (details.engines?.total > 0) {
@@ -428,6 +651,11 @@ function askForConfirmation(skillName, reason, details = {}) {
     }
     log(message, 'red');
     return false; // 恶意直接拒绝
+  } else if (reason === 'unknown_source') {
+    message = `⚠️ 未知来源 Skill`;
+    if (details.author) {
+      message += `\n   作者：${details.author}`;
+    }
   }
   
   log(message, 'yellow');
@@ -485,7 +713,41 @@ async function main() {
   log(`\n🛡️ 开始 Skills 安全安装流程`, 'cyan', true);
   log(`📋 检查 Skill: ${skillName}`, 'cyan');
   
-  // 第一步：评分检查
+  // 第一步：Skill-Vetter 代码审查
+  if (!options.noVetter) {
+    const vetResult = await vetSkill(skillName, options);
+    
+    // 极高风险直接拒绝
+    if (vetResult.riskLevel === 'extreme') {
+      log(`\n🚨 发现极端危险代码，禁止安装！`, 'red', true);
+      if (vetResult.redFlags.length > 0) {
+        log(`\n红旗列表:`, 'red');
+        for (const flag of vetResult.redFlags) {
+          if (flag.severity === 'extreme') {
+            log(`  🚨 ${flag.name} (${flag.file}:${flag.line})`, 'red');
+          }
+        }
+      }
+      process.exit(6);
+    }
+    
+    // 高风险或发现红旗需要确认
+    if (vetResult.needsConfirm) {
+      const confirmed = askForConfirmation(skillName, 'vetter_red_flags', { 
+        redFlags: vetResult.redFlags,
+        riskLevel: vetResult.riskLevel,
+        author: vetResult.author,
+        skillInfo: {}
+      });
+      
+      if (!confirmed) {
+        log(`\n❌ 安装已取消`, 'red');
+        process.exit(5);
+      }
+    }
+  }
+  
+  // 第二步：评分检查
   const ratingResult = await checkRating(skillName);
   
   if (ratingResult.needsConfirm) {
@@ -500,7 +762,7 @@ async function main() {
     }
   }
   
-  // 第二步：沙箱扫描（除非 --no-scan）
+  // 第三步：沙箱扫描（除非 --no-scan）
   let scanResult = { passed: true, needsConfirm: false };
   
   if (!options.noScan) {
@@ -535,7 +797,7 @@ async function main() {
     }
   }
   
-  // 第三步：执行安装
+  // 第四步：执行安装
   if (scanResult.passed || options.force) {
     const success = installSkill(skillName, options.dryRun);
     process.exit(success ? 0 : 3);
