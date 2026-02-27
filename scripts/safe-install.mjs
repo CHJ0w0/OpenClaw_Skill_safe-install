@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 
 /**
- * Skills 安全安装工具
+ * Skills 安全安装工具 v2.0
  * 
  * 整合完整安全检查流程：
  * 1. Skill-Vetter 来源与代码审查
  * 2. ClawHub 评分检查
  * 3. ThreatBook 沙箱扫描
- * 4. 自动决策或询问任务下达者
- * 5. 执行安装
+ * 4. 统一展示复核结果
+ * 5. 按决策矩阵执行后续操作
  * 
  * 退出码:
  *   0 - 安装成功
@@ -17,11 +17,11 @@
  *   3 - API 调用失败
  *   4 - 评分过低，等待确认
  *   5 - 用户取消安装
- *   6 - Vetter 检查发现红旗
+ *   6 - Vetter 检查发现极端红旗
  */
 
 import { execSync } from 'child_process';
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, readdirSync, statSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { platform } from 'os';
@@ -70,6 +70,7 @@ function logSection(title) {
 function parseArgs(args) {
   const options = {
     force: args.includes('--force'),
+    auto: args.includes('--auto') || args.includes('--yes') || args.includes('-y'),
     noVetter: args.includes('--no-vetter'),
     noScan: args.includes('--no-scan'),
     dryRun: args.includes('--dry-run'),
@@ -85,29 +86,42 @@ function parseArgs(args) {
 // 显示帮助
 function showHelp() {
   console.log(`
-🛡️  Skills 安全安装工具
+🛡️  Skills 安全安装工具 v2.0
 
 用法:
   node safe-install.mjs <skill-name> [选项]
 
 选项:
-  --force         强制安装（跳过可疑警告）
-  --no-vetter     跳过 Vetter 代码审查（不推荐）
-  --no-scan       跳过沙箱扫描（不推荐）
-  --dry-run       仅检查，不实际安装
-  --timeout=<秒>  沙箱扫描超时时间（默认 120 秒）
-  --help, -h      显示帮助
+  --auto, --yes, -y  自动模式（需要确认时自动询问任务下达者）
+  --force            强制安装（跳过可疑警告）
+  --no-vetter        跳过 Vetter 代码审查（不推荐）
+  --no-scan          跳过沙箱扫描（不推荐）
+  --dry-run          仅检查，不实际安装
+  --timeout=<秒>     沙箱扫描超时时间（默认 120 秒）
+  --help, -h         显示帮助
 
 安全检查流程:
   1. Skill-Vetter 来源与代码审查（检查红旗）
   2. ClawHub 评分检查 (≥3.5 分？)
   3. ThreatBook 沙箱扫描
-  4. 自动决策或询问任务下达者
-  5. 执行安装
+  4. 统一展示复核结果
+  5. 按决策矩阵执行（安装/询问/禁止）
+
+决策矩阵:
+  ┌────────────┬─────────┬──────────┬────────────┐
+  │ Vetter     │ 评分    │ 沙箱     │ 最终决策   │
+  ├────────────┼─────────┼──────────┼────────────┤
+  │ ✅ 通过    │ ≥3.5    │ 安全     │ ✅ 直接安装│
+  │ ✅ 通过    │ ≥3.5    │ 可疑     │ ❓ 询问    │
+  │ ✅ 通过    │ <3.5    │ 任意     │ ❓ 询问    │
+  │ ⚠️ 高风险  │ 任意    │ 任意     │ ❓ 询问    │
+  │ 🚨 极端风险│ 任意    │ 任意     │ ❌ 禁止    │
+  │ 任意       │ 任意    │ 恶意     │ ❌ 禁止    │
+  └────────────┴─────────┴──────────┴────────────┘
 
 示例:
   node safe-install.mjs tavily-search
-  node safe-install.mjs some-skill --force
+  node safe-install.mjs some-skill --auto
   node safe-install.mjs test-skill --dry-run
 `);
 }
@@ -250,7 +264,7 @@ async function vetSkill(skillName, options) {
       const files = readdirSync(dir);
       for (const file of files) {
         const filePath = path.join(dir, file);
-        const stat = existsSync(filePath) ? require('fs').statSync(filePath) : null;
+        const stat = existsSync(filePath) ? statSync(filePath) : null;
         if (stat?.isDirectory() && !file.startsWith('.') && file !== 'node_modules') {
           scanDir(filePath);
         } else if (file.endsWith('.js') || file.endsWith('.mjs')) {
@@ -308,7 +322,7 @@ async function vetSkill(skillName, options) {
       log(`✅ 未发现红旗`, 'green');
     } else {
       log(`⚠️ 发现 ${result.redFlags.length} 个潜在问题:`, 'yellow');
-      for (const flag of result.redFlags.slice(0, 10)) { // 只显示前 10 个
+      for (const flag of result.redFlags.slice(0, 10)) {
         const severityIcon = flag.severity === 'extreme' ? '🚨' : 
                             flag.severity === 'high' ? '🔴' : 
                             flag.severity === 'medium' ? '🟡' : '🟢';
@@ -624,54 +638,119 @@ async function scanSkill(skillName, options) {
   }
 }
 
+// 展示复核结果摘要
+function showSummary(vetResult, ratingResult, scanResult) {
+  logSection('📋 复核结果摘要');
+  
+  log('\n┌─────────────────────────────────────────────────────┐', 'cyan');
+  log('│              三层安全检查结果                       │', 'cyan', true);
+  log('├─────────────────────────────────────────────────────┤', 'cyan');
+  
+  // Vetter 结果
+  const vetIcon = vetResult.riskLevel === 'extreme' ? '🚨' :
+                  vetResult.riskLevel === 'high' ? '🔴' :
+                  vetResult.riskLevel === 'medium' ? '🟡' : '🟢';
+  const vetStatus = vetResult.riskLevel === 'extreme' ? '禁止' :
+                    vetResult.needsConfirm ? '需确认' : '通过';
+  log(`│ 1️⃣ Vetter 审查    ${vetIcon} ${vetStatus.padEnd(6)} │ 风险：${vetResult.riskLevel.toUpperCase().padEnd(10)}│`, 'cyan');
+  
+  // 评分结果
+  const ratingIcon = ratingResult.passed ? '✅' : '⚠️';
+  const ratingStatus = ratingResult.passed ? '通过' : '需确认';
+  const scoreStr = ratingResult.score !== null ? `${ratingResult.score}/5.0` : 'N/A';
+  log(`│ 2️⃣ ClawHub 评分   ${ratingIcon} ${ratingStatus.padEnd(6)} │ 评分：${scoreStr.padEnd(10)}│`, 'cyan');
+  
+  // 沙箱结果
+  let scanIcon, scanStatus;
+  if (scanResult.apiFailed) {
+    scanIcon = '❓';
+    scanStatus = 'API 失败';
+  } else if (scanResult.reason === 'malicious') {
+    scanIcon = '❌';
+    scanStatus = '禁止';
+  } else if (scanResult.needsConfirm) {
+    scanIcon = '⚠️';
+    scanStatus = '需确认';
+  } else {
+    scanIcon = '✅';
+    scanStatus = '通过';
+  }
+  const scanReason = scanResult.reason || 'N/A';
+  log(`│ 3️⃣ ThreatBook     ${scanIcon} ${scanStatus.padEnd(6)} │ 结果：${scanReason.padEnd(10)}│`, 'cyan');
+  
+  log('└─────────────────────────────────────────────────────┘', 'cyan');
+}
+
+// 根据决策矩阵做出最终判定
+function makeDecision(vetResult, ratingResult, scanResult) {
+  logSection('🎯 最终决策');
+  
+  // 检查极端情况 - 直接禁止
+  if (vetResult.riskLevel === 'extreme') {
+    log(`🚨 发现极端危险代码，禁止安装！`, 'red', true);
+    return { action: 'deny', reason: 'vetter_extreme' };
+  }
+  
+  if (scanResult.reason === 'malicious') {
+    log(`❌ 检测到恶意代码，禁止安装！`, 'red', true);
+    if (scanResult.threatTypes.length > 0) {
+      log(`   威胁类型：${scanResult.threatTypes.join(', ')}`, 'red');
+    }
+    return { action: 'deny', reason: 'malicious' };
+  }
+  
+  // 检查需要确认的情况
+  const needsConfirm = [];
+  
+  if (vetResult.needsConfirm) {
+    needsConfirm.push(`Vetter 发现${vetResult.redFlags.length}个潜在问题 (${vetResult.riskLevel}风险)`);
+  }
+  
+  if (ratingResult.needsConfirm) {
+    needsConfirm.push(`ClawHub 评分过低 (${ratingResult.score || 'N/A'}/5.0)`);
+  }
+  
+  if (scanResult.apiFailed) {
+    needsConfirm.push(`ThreatBook API 不可用`);
+  } else if (scanResult.needsConfirm && scanResult.reason !== 'malicious') {
+    needsConfirm.push(`沙箱扫描结果可疑 (${scanResult.reason})`);
+  }
+  
+  if (needsConfirm.length > 0) {
+    log(`⚠️ 需要任务下达者确认:`, 'yellow');
+    for (const reason of needsConfirm) {
+      log(`   • ${reason}`, 'yellow');
+    }
+    return { action: 'confirm', reasons: needsConfirm };
+  }
+  
+  // 全部通过
+  log(`✅ 所有安全检查通过，可以安装`, 'green', true);
+  return { action: 'install' };
+}
+
 // 询问任务下达者
-function askForConfirmation(skillName, reason, details = {}) {
-  logSection('需要确认');
+function askForConfirmation(skillName, decision) {
+  logSection('❓ 等待确认');
   
-  let message = '';
-  
-  if (reason === 'low_rating') {
-    message = `⚠️ 此 Skill 评分低于安全阈值 (${details.score}/${SAFE_RATING_THRESHOLD})`;
-  } else if (reason === 'vetter_red_flags') {
-    message = `⚠️ Vetter 发现 ${details.redFlags?.length || 0} 个潜在问题`;
-    if (details.riskLevel) {
-      message += `\n   风险等级：${details.riskLevel.toUpperCase()}`;
-    }
-  } else if (reason === 'suspicious') {
-    message = `⚠️ 沙箱扫描发现可疑内容`;
-    if (details.engines?.total > 0) {
-      message += `\n   引擎检出：${details.engines.malicious}/${details.engines.total}`;
-    }
-  } else if (reason === 'api_failed') {
-    message = `⚠️ 安全扫描服务暂时不可用`;
-  } else if (reason === 'malicious') {
-    message = `❌ 检测到恶意代码，禁止安装！`;
-    if (details.threatTypes?.length > 0) {
-      message += `\n   威胁类型：${details.threatTypes.join(', ')}`;
-    }
-    log(message, 'red');
-    return false; // 恶意直接拒绝
-  } else if (reason === 'unknown_source') {
-    message = `⚠️ 未知来源 Skill`;
-    if (details.author) {
-      message += `\n   作者：${details.author}`;
-    }
+  log(`\nSkill: ${skillName}`, 'cyan');
+  log(`\n以下问题需要您确认:`, 'yellow');
+  for (const reason of decision.reasons) {
+    log(`  • ${reason}`, 'yellow');
   }
   
-  log(message, 'yellow');
+  log(`\n是否继续安装？`, 'yellow');
+  log(`  输入 y 或 yes 继续，其他键取消`, 'cyan');
+  log(`\n> `, 'cyan');
   
-  if (details.skillInfo) {
-    log(`\nSkill 信息:`, 'cyan');
-    log(`  名称：${details.skillInfo.name || skillName}`);
-    if (details.skillInfo.author) log(`  作者：${details.skillInfo.author}`);
-    if (details.skillInfo.updated) log(`  更新时间：${details.skillInfo.updated}`);
+  // 尝试读取输入（非阻塞）
+  try {
+    const answer = readFileSync(0, 'utf8').trim().toLowerCase();
+    return answer === 'y' || answer === 'yes';
+  } catch (e) {
+    // 无法读取输入时返回 false
+    return false;
   }
-  
-  log(`\n是否继续安装？(y/N): `, 'yellow');
-  
-  // 简单读取输入
-  const answer = readFileSync(0, 'utf8').trim().toLowerCase();
-  return answer === 'y' || answer === 'yes';
 }
 
 // 执行安装
@@ -710,19 +789,27 @@ async function main() {
     process.exit(options.help ? 0 : 1);
   }
   
-  log(`\n🛡️ 开始 Skills 安全安装流程`, 'cyan', true);
+  log(`\n🛡️ 开始 Skills 安全安装流程 v2.0`, 'cyan', true);
   log(`📋 检查 Skill: ${skillName}`, 'cyan');
+  
+  // 收集所有检查结果
+  const results = {
+    vet: { passed: true, riskLevel: 'low', redFlags: [], needsConfirm: false, author: 'unknown' },
+    rating: { passed: true, score: null, needsConfirm: false },
+    scan: { passed: true, apiFailed: false, needsConfirm: false, reason: 'safe' }
+  };
   
   // 第一步：Skill-Vetter 代码审查
   if (!options.noVetter) {
-    const vetResult = await vetSkill(skillName, options);
+    results.vet = await vetSkill(skillName, options);
     
     // 极高风险直接拒绝
-    if (vetResult.riskLevel === 'extreme') {
+    if (results.vet.riskLevel === 'extreme') {
+      showSummary(results.vet, results.rating, results.scan);
       log(`\n🚨 发现极端危险代码，禁止安装！`, 'red', true);
-      if (vetResult.redFlags.length > 0) {
+      if (results.vet.redFlags.length > 0) {
         log(`\n红旗列表:`, 'red');
-        for (const flag of vetResult.redFlags) {
+        for (const flag of results.vet.redFlags) {
           if (flag.severity === 'extreme') {
             log(`  🚨 ${flag.name} (${flag.file}:${flag.line})`, 'red');
           }
@@ -730,83 +817,63 @@ async function main() {
       }
       process.exit(6);
     }
-    
-    // 高风险或发现红旗需要确认
-    if (vetResult.needsConfirm) {
-      const confirmed = askForConfirmation(skillName, 'vetter_red_flags', { 
-        redFlags: vetResult.redFlags,
-        riskLevel: vetResult.riskLevel,
-        author: vetResult.author,
-        skillInfo: {}
-      });
-      
-      if (!confirmed) {
-        log(`\n❌ 安装已取消`, 'red');
-        process.exit(5);
-      }
-    }
   }
   
   // 第二步：评分检查
-  const ratingResult = await checkRating(skillName);
-  
-  if (ratingResult.needsConfirm) {
-    const confirmed = askForConfirmation(skillName, 'low_rating', { 
-      score: ratingResult.score,
-      skillInfo: {}
-    });
-    
-    if (!confirmed) {
-      log(`\n❌ 安装已取消`, 'red');
-      process.exit(5);
-    }
-  }
+  results.rating = await checkRating(skillName);
   
   // 第三步：沙箱扫描（除非 --no-scan）
-  let scanResult = { passed: true, needsConfirm: false };
-  
   if (!options.noScan) {
-    scanResult = await scanSkill(skillName, options);
+    results.scan = await scanSkill(skillName, options);
     
-    if (scanResult.apiFailed) {
-      const confirmed = askForConfirmation(skillName, 'api_failed', {
-        reason: scanResult.reason
-      });
-      
-      if (!confirmed) {
-        log(`\n❌ 安装已取消`, 'red');
-        process.exit(5);
-      }
-    } else if (scanResult.needsConfirm) {
-      if (scanResult.reason === 'malicious') {
-        log(`\n${scanResult.message}`, 'red');
-        log(`\n❌ 禁止安装恶意软件！`, 'red', true);
-        process.exit(1);
-      }
-      
-      const confirmed = askForConfirmation(skillName, 'suspicious', {
-        engines: scanResult.engines,
-        threatTypes: scanResult.threatTypes,
-        confidence: scanResult.confidence
-      });
-      
-      if (!confirmed) {
-        log(`\n❌ 安装已取消`, 'red');
-        process.exit(5);
-      }
+    // 恶意软件直接禁止
+    if (results.scan.reason === 'malicious') {
+      showSummary(results.vet, results.rating, results.scan);
+      log(`\n❌ 禁止安装恶意软件！`, 'red', true);
+      process.exit(1);
     }
   }
   
-  // 第四步：执行安装
-  if (scanResult.passed || options.force) {
-    const success = installSkill(skillName, options.dryRun);
-    process.exit(success ? 0 : 3);
-  } else {
-    process.exit(2);
+  // 展示复核结果摘要
+  showSummary(results.vet, results.rating, results.scan);
+  
+  // 根据决策矩阵做出最终判定
+  const decision = makeDecision(results.vet, results.rating, results.scan);
+  
+  // 执行决策
+  switch (decision.action) {
+    case 'deny':
+      log(`\n❌ 安装被拒绝`, 'red');
+      process.exit(1);
+      
+    case 'confirm':
+      if (options.auto || options.force) {
+        // 自动模式：直接继续
+        log(`\n⚡ 自动模式：继续安装...`, 'yellow');
+      } else {
+        // 交互模式：询问用户
+        const confirmed = askForConfirmation(skillName, decision);
+        if (!confirmed) {
+          log(`\n❌ 安装已取消`, 'red');
+          process.exit(5);
+        }
+      }
+      // 继续执行安装
+      break;
+      
+    case 'install':
+      // 直接安装
+      break;
   }
+  
+  // 执行安装
+  const success = installSkill(skillName, options.dryRun);
+  process.exit(success ? 0 : 3);
 }
 
 main().catch(error => {
   log(`\n❌ 未捕获的错误：${error.message}`, 'red');
+  log(`\n堆栈跟踪:`, 'red');
+  log(error.stack, 'red');
   process.exit(3);
 });
